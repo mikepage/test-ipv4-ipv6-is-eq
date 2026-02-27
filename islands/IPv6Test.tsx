@@ -408,17 +408,6 @@ export default function IPv6Test() {
                   </div>
                 </div>
 
-                {r.headerComparison.ipv4StatusCode &&
-                  r.headerComparison.ipv4StatusCode >= 300 &&
-                  r.headerComparison.ipv4StatusCode < 400 &&
-                  r.headerComparison.statusEqual && (
-                  <p class="text-xs text-gray-500">
-                    Redirect response over HTTP is normal — most sites redirect
-                    to HTTPS. The test compares whether both IPv4 and IPv6
-                    return the same redirect.
-                  </p>
-                )}
-
                 {r.headerComparison.headerDiffs.length > 0 && (
                   <div>
                     <button
@@ -525,10 +514,8 @@ export default function IPv6Test() {
                 </span>
               </div>
               <p class="mt-1 text-xs text-gray-500">
-                Content compared after stripping nonces and VIEWSTATE tokens
-                (internet.nl method). ≤10% distance = pass. Comparison is
-                done over HTTP (port 80) to verify both protocols serve
-                equivalent responses.
+                Content compared over HTTPS after stripping nonces and
+                VIEWSTATE tokens (internet.nl method). ≤10% distance = pass.
               </p>
             </ResultCard>
           )}

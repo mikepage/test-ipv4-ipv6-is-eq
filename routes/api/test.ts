@@ -1,4 +1,6 @@
 import { define } from "../../utils.ts";
+import tls from "node:tls";
+import { Buffer } from "node:buffer";
 
 interface PortResult {
   ipv4: boolean;
@@ -127,106 +129,114 @@ interface FetchResult {
   connectedAddress: string;
 }
 
-async function fetchViaIP(
+function parseHttpResponse(raw: string): {
+  status: number;
+  headers: Headers;
+  body: string;
+} {
+  const headerEnd = raw.indexOf("\r\n\r\n");
+  if (headerEnd === -1) throw new Error("No header boundary in response");
+
+  const headerSection = raw.substring(0, headerEnd);
+  const bodyRaw = raw.substring(headerEnd + 4);
+  const headerLines = headerSection.split("\r\n");
+  const statusMatch = headerLines[0].match(/^HTTP\/[\d.]+ (\d+)/);
+  if (!statusMatch) throw new Error("Bad status line: " + headerLines[0]);
+
+  const status = parseInt(statusMatch[1]);
+  const headers = new Headers();
+  for (let j = 1; j < headerLines.length; j++) {
+    const colonIdx = headerLines[j].indexOf(":");
+    if (colonIdx > 0) {
+      headers.append(
+        headerLines[j].substring(0, colonIdx).trim(),
+        headerLines[j].substring(colonIdx + 1).trim(),
+      );
+    }
+  }
+
+  let body: string;
+  if (headers.get("transfer-encoding")?.includes("chunked")) {
+    body = "";
+    let pos = 0;
+    while (pos < bodyRaw.length) {
+      const lineEnd = bodyRaw.indexOf("\r\n", pos);
+      if (lineEnd === -1) break;
+      const size = parseInt(bodyRaw.substring(pos, lineEnd).trim(), 16);
+      if (isNaN(size) || size === 0) break;
+      body += bodyRaw.substring(lineEnd + 2, lineEnd + 2 + size);
+      pos = lineEnd + 2 + size + 2;
+    }
+  } else {
+    body = bodyRaw;
+  }
+
+  return { status, headers, body };
+}
+
+function fetchViaIP(
   ip: string,
   hostname: string,
 ): Promise<FetchResult | string> {
-  try {
-    const conn = await Deno.connect({
-      hostname: ip,
-      port: 80,
-      transport: "tcp",
-    });
-    const remoteAddr = conn.remoteAddr as Deno.NetAddr;
-    const connectedAddress = `${remoteAddr.hostname}:${remoteAddr.port}`;
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      resolve("Connection timed out after 15s");
+    }, 15000);
 
     try {
-      const request = `GET / HTTP/1.1\r\n` +
-        `Host: ${hostname}\r\n` +
-        `User-Agent: Mozilla/5.0 (compatible; IPv6EqualityTest/1.0)\r\n` +
-        `Accept: */*\r\n` +
-        `Accept-Encoding: identity\r\n` +
-        `Connection: close\r\n` +
-        `\r\n`;
+      const socket = tls.connect({
+        host: ip,
+        port: 443,
+        servername: hostname,
+      }, () => {
+        const connectedAddress = `${socket.remoteAddress}:${socket.remotePort}`;
 
-      const encoded = new TextEncoder().encode(request);
-      let written = 0;
-      while (written < encoded.length) {
-        written += await conn.write(encoded.subarray(written));
-      }
+        const request = `GET / HTTP/1.1\r\n` +
+          `Host: ${hostname}\r\n` +
+          `User-Agent: Mozilla/5.0 (compatible; IPv6EqualityTest/1.0)\r\n` +
+          `Accept: */*\r\n` +
+          `Accept-Encoding: identity\r\n` +
+          `Connection: close\r\n` +
+          `\r\n`;
 
-      try {
-        await conn.closeWrite();
-      } catch {
-        // closeWrite may not be available
-      }
+        socket.write(request);
 
-      const chunks: Uint8Array[] = [];
-      let totalLen = 0;
-      const buf = new Uint8Array(32768);
-      while (totalLen < SIMHASH_MAX_RESPONSE_SIZE + 65536) {
-        const n = await conn.read(buf);
-        if (n === null) break;
-        chunks.push(buf.slice(0, n));
-        totalLen += n;
-      }
+        const chunks: Buffer[] = [];
+        let totalLen = 0;
 
-      const combined = new Uint8Array(totalLen);
-      let offset = 0;
-      for (const chunk of chunks) {
-        combined.set(chunk, offset);
-        offset += chunk.length;
-      }
+        socket.on("data", (chunk: Buffer) => {
+          if (totalLen < SIMHASH_MAX_RESPONSE_SIZE + 65536) {
+            chunks.push(chunk);
+            totalLen += chunk.length;
+          }
+        });
 
-      const raw = new TextDecoder("utf-8", { fatal: false }).decode(combined);
-      const headerEnd = raw.indexOf("\r\n\r\n");
-      if (headerEnd === -1) throw new Error("No header boundary in response");
+        socket.on("end", () => {
+          clearTimeout(timeout);
+          try {
+            const raw = Buffer.concat(chunks).toString("utf-8");
+            const { status, headers, body } = parseHttpResponse(raw);
+            resolve({ status, headers, body, connectedAddress });
+          } catch (e) {
+            resolve(e instanceof Error ? e.message : String(e));
+          }
+        });
 
-      const headerSection = raw.substring(0, headerEnd);
-      const bodyRaw = raw.substring(headerEnd + 4);
-      const headerLines = headerSection.split("\r\n");
-      const statusMatch = headerLines[0].match(/^HTTP\/[\d.]+ (\d+)/);
-      if (!statusMatch) throw new Error("Bad status line: " + headerLines[0]);
+        socket.on("error", (err: Error) => {
+          clearTimeout(timeout);
+          resolve(err.message);
+        });
+      });
 
-      const status = parseInt(statusMatch[1]);
-      const headers = new Headers();
-      for (let j = 1; j < headerLines.length; j++) {
-        const colonIdx = headerLines[j].indexOf(":");
-        if (colonIdx > 0) {
-          headers.append(
-            headerLines[j].substring(0, colonIdx).trim(),
-            headerLines[j].substring(colonIdx + 1).trim(),
-          );
-        }
-      }
-
-      let body: string;
-      if (headers.get("transfer-encoding")?.includes("chunked")) {
-        body = "";
-        let pos = 0;
-        while (pos < bodyRaw.length) {
-          const lineEnd = bodyRaw.indexOf("\r\n", pos);
-          if (lineEnd === -1) break;
-          const size = parseInt(bodyRaw.substring(pos, lineEnd).trim(), 16);
-          if (isNaN(size) || size === 0) break;
-          body += bodyRaw.substring(lineEnd + 2, lineEnd + 2 + size);
-          pos = lineEnd + 2 + size + 2;
-        }
-      } else {
-        body = bodyRaw;
-      }
-
-      return { status, headers, body, connectedAddress };
-    } finally {
-      try {
-        conn.close();
-      } catch {
-        // already closed
-      }
+      socket.on("error", (err: Error) => {
+        clearTimeout(timeout);
+        resolve(err.message);
+      });
+    } catch (e) {
+      clearTimeout(timeout);
+      resolve(e instanceof Error ? e.message : String(e));
     }
-  } catch (e) {
-    return e instanceof Error ? e.message : String(e);
-  }
+  });
 }
 
 const COMPARE_HEADERS = [
@@ -321,7 +331,7 @@ export const handler = define.handlers({
       https: { ipv4: https4, ipv6: https6, equal: https4 === https6 },
     };
 
-    // Fetch content over HTTP (port 80) via raw TCP to specific IPs
+    // Fetch content over HTTPS (port 443) via node:tls to specific IPs
     const [r4, r6] = await Promise.all([
       fetchViaIP(ipv4, hostname),
       fetchViaIP(ipv6, hostname),
