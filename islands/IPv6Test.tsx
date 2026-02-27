@@ -43,6 +43,10 @@ interface TestResult {
     ipv4: string[];
     ipv6: string[];
   };
+  connectedAddresses: {
+    ipv4: string | null;
+    ipv6: string | null;
+  };
   overallPass: boolean;
   error?: string;
   debug?: { ipv4Error?: string; ipv6Error?: string };
@@ -331,12 +335,22 @@ export default function IPv6Test() {
                 <div class="font-mono">
                   {r.ipv4Address || "No record"}
                 </div>
+                {r.connectedAddresses.ipv4 && (
+                  <div class="text-xs text-green-600 mt-1">
+                    ✓ Connected to {r.connectedAddresses.ipv4}
+                  </div>
+                )}
               </div>
               <div>
                 <div class="font-medium text-gray-700">IPv6 (AAAA)</div>
                 <div class="font-mono">
                   {r.ipv6Address || "No record"}
                 </div>
+                {r.connectedAddresses.ipv6 && (
+                  <div class="text-xs text-green-600 mt-1">
+                    ✓ Connected to {r.connectedAddresses.ipv6}
+                  </div>
+                )}
               </div>
             </div>
           </ResultCard>

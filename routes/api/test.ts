@@ -42,6 +42,10 @@ interface TestResult {
     ipv4: string[];
     ipv6: string[];
   };
+  connectedAddresses: {
+    ipv4: string | null;
+    ipv6: string | null;
+  };
   overallPass: boolean;
   error?: string;
   debug?: { ipv4Error?: string; ipv6Error?: string };
@@ -125,6 +129,7 @@ interface FetchResult {
   headers: Headers;
   body: string;
   redirectChain: string[];
+  connectedAddress: string;
 }
 
 // Raw HTTP/1.1 over plain TCP using legacy read/write APIs
@@ -133,12 +138,19 @@ async function rawHttpGet(
   ip: string,
   hostname: string,
   path: string,
-): Promise<{ status: number; headers: Headers; body: string }> {
+): Promise<{
+  status: number;
+  headers: Headers;
+  body: string;
+  connectedAddress: string;
+}> {
   const conn = await Deno.connect({
     hostname: ip,
     port: 80,
     transport: "tcp",
   });
+  const remoteAddr = conn.remoteAddr as Deno.NetAddr;
+  const connectedAddress = `${remoteAddr.hostname}:${remoteAddr.port}`;
 
   try {
     const request = `GET ${path} HTTP/1.1\r\n` +
@@ -219,7 +231,7 @@ async function rawHttpGet(
       body = bodyRaw;
     }
 
-    return { status, headers, body };
+    return { status, headers, body, connectedAddress };
   } finally {
     try {
       conn.close();
@@ -276,6 +288,7 @@ async function fetchViaIP(
         headers: resp.headers,
         body: resp.body,
         redirectChain,
+        connectedAddress: resp.connectedAddress,
       };
     } catch (e) {
       return e instanceof Error ? e.message : String(e);
@@ -348,6 +361,10 @@ export const handler = define.handlers({
         ipv4: [],
         ipv6: [],
       },
+      connectedAddresses: {
+        ipv4: null,
+        ipv6: null,
+      },
       overallPass: false,
     };
 
@@ -390,6 +407,9 @@ export const handler = define.handlers({
     const resp6 = typeof r6 === "string" ? null : r6;
     const err4 = typeof r4 === "string" ? r4 : null;
     const err6 = typeof r6 === "string" ? r6 : null;
+
+    if (resp4) result.connectedAddresses.ipv4 = resp4.connectedAddress;
+    if (resp6) result.connectedAddresses.ipv6 = resp6.connectedAddress;
 
     if (resp4 && resp6) {
       result.headerComparison.ipv4StatusCode = resp4.status;
