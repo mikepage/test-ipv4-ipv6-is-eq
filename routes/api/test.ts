@@ -54,12 +54,11 @@ async function resolveDns(
 async function checkPort(
   address: string,
   port: number,
-  isIPv6: boolean,
+  _isIPv6: boolean,
 ): Promise<boolean> {
   try {
-    const host = isIPv6 ? `[${address}]` : address;
     const conn = await Deno.connect({
-      hostname: host,
+      hostname: address,
       port,
       transport: "tcp",
     });
@@ -97,11 +96,113 @@ function computeSimilarity(a: string, b: string): number {
   return Math.round((matching / maxLen) * 1000) / 10;
 }
 
+interface ParsedResponse {
+  status: number;
+  statusText: string;
+  headers: Headers;
+  body: string;
+}
+
+async function httpRequestOverConnection(
+  conn: Deno.Conn,
+  hostname: string,
+  path: string,
+): Promise<ParsedResponse> {
+  const request = `GET ${path} HTTP/1.1\r\n` +
+    `Host: ${hostname}\r\n` +
+    `User-Agent: Mozilla/5.0 (compatible; IPv6EqualityTest/1.0)\r\n` +
+    `Accept: */*\r\n` +
+    `Connection: close\r\n` +
+    `\r\n`;
+
+  const writer = conn.writable.getWriter();
+  await writer.write(new TextEncoder().encode(request));
+  await writer.close();
+
+  const chunks: Uint8Array[] = [];
+  const reader = conn.readable.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+
+  const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);
+  const combined = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  const raw = new TextDecoder().decode(combined);
+  const headerEnd = raw.indexOf("\r\n\r\n");
+  if (headerEnd === -1) throw new Error("Invalid HTTP response");
+
+  const headerSection = raw.substring(0, headerEnd);
+  const bodyRaw = raw.substring(headerEnd + 4);
+
+  const headerLines = headerSection.split("\r\n");
+  const statusLine = headerLines[0];
+  const statusMatch = statusLine.match(/^HTTP\/[\d.]+ (\d+)\s*(.*)/);
+  if (!statusMatch) throw new Error("Invalid status line: " + statusLine);
+
+  const status = parseInt(statusMatch[1]);
+  const statusText = statusMatch[2];
+  const headers = new Headers();
+  for (let i = 1; i < headerLines.length; i++) {
+    const colonIdx = headerLines[i].indexOf(":");
+    if (colonIdx > 0) {
+      headers.append(
+        headerLines[i].substring(0, colonIdx).trim(),
+        headerLines[i].substring(colonIdx + 1).trim(),
+      );
+    }
+  }
+
+  // Handle chunked transfer encoding
+  let body: string;
+  if (headers.get("transfer-encoding")?.includes("chunked")) {
+    body = decodeChunked(bodyRaw);
+  } else {
+    body = bodyRaw;
+  }
+
+  return { status, statusText, headers, body };
+}
+
+function decodeChunked(raw: string): string {
+  let result = "";
+  let pos = 0;
+  while (pos < raw.length) {
+    const lineEnd = raw.indexOf("\r\n", pos);
+    if (lineEnd === -1) break;
+    const sizeStr = raw.substring(pos, lineEnd).trim();
+    const size = parseInt(sizeStr, 16);
+    if (isNaN(size) || size === 0) break;
+    const chunkStart = lineEnd + 2;
+    result += raw.substring(chunkStart, chunkStart + size);
+    pos = chunkStart + size + 2; // skip chunk data + trailing \r\n
+  }
+  return result;
+}
+
+async function connectToIP(
+  ip: string,
+  port: number,
+  hostname: string,
+  useTls: boolean,
+): Promise<Deno.Conn> {
+  const tcpConn = await Deno.connect({ hostname: ip, port, transport: "tcp" });
+  if (!useTls) return tcpConn;
+  return await Deno.startTls(tcpConn, { hostname });
+}
+
 async function fetchViaIP(
   ip: string,
   hostname: string,
   protocol: string,
-  isIPv6: boolean,
+  _isIPv6: boolean,
   followRedirects: boolean,
 ): Promise<{
   status: number;
@@ -110,22 +211,22 @@ async function fetchViaIP(
   redirectChain: string[];
 } | null> {
   const redirectChain: string[] = [];
-  let currentUrl =
-    `${protocol}://${isIPv6 ? `[${ip}]` : ip}${protocol === "https" ? "" : ""}`;
+  let currentHostname = hostname;
+  let currentPath = "/";
+  let currentProtocol = protocol;
+  let currentIp = ip;
   const maxRedirects = followRedirects ? 10 : 0;
 
   for (let i = 0; i <= maxRedirects; i++) {
     try {
-      const resp = await fetch(currentUrl, {
-        headers: {
-          Host: hostname,
-          "User-Agent":
-            "Mozilla/5.0 (compatible; IPv6EqualityTest/1.0)",
-        },
-        redirect: "manual",
-      });
-
-      const body = await resp.text();
+      const useTls = currentProtocol === "https";
+      const port = useTls ? 443 : 80;
+      const conn = await connectToIP(currentIp, port, currentHostname, useTls);
+      const resp = await httpRequestOverConnection(
+        conn,
+        currentHostname,
+        currentPath,
+      );
 
       if (
         followRedirects && resp.status >= 300 && resp.status < 400 &&
@@ -136,18 +237,30 @@ async function fetchViaIP(
 
         if (location.startsWith("http")) {
           const redirectUrl = new URL(location);
-          const redirectProtocol = redirectUrl.protocol.replace(":", "");
-          currentUrl =
-            `${redirectProtocol}://${isIPv6 ? `[${ip}]` : ip}${redirectUrl.pathname}${redirectUrl.search}`;
-          hostname = redirectUrl.hostname;
+          // If redirect goes to a different host, re-resolve DNS for the new host
+          if (redirectUrl.hostname !== currentHostname) {
+            currentHostname = redirectUrl.hostname;
+            const newIp = await resolveDns(
+              currentHostname,
+              ip.includes(":") ? "AAAA" : "A",
+            );
+            if (!newIp) return null;
+            currentIp = newIp;
+          }
+          currentProtocol = redirectUrl.protocol.replace(":", "");
+          currentPath = redirectUrl.pathname + redirectUrl.search;
         } else {
-          const base = new URL(currentUrl);
-          currentUrl = `${base.protocol}//${base.host}${location}`;
+          currentPath = location;
         }
         continue;
       }
 
-      return { status: resp.status, headers: resp.headers, body, redirectChain };
+      return {
+        status: resp.status,
+        headers: resp.headers,
+        body: resp.body,
+        redirectChain,
+      };
     } catch {
       return null;
     }
