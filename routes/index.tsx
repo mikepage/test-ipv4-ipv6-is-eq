@@ -4,7 +4,10 @@ import IPv6Test from "../islands/IPv6Test.tsx";
 
 export default define.page(function Home() {
   return (
-    <div class="min-h-screen bg-[#fafafa]">
+    <div
+      class="min-h-screen bg-[#fafafa]"
+      style={{ fontFamily: "'JetBrains Mono', monospace" }}
+    >
       <Head>
         <title>IPv4/IPv6 Equality Test</title>
         <link
@@ -13,10 +16,7 @@ export default define.page(function Home() {
         />
       </Head>
 
-      <div
-        class="px-4 py-8 mx-auto max-w-2xl"
-        style={{ fontFamily: "'JetBrains Mono', monospace" }}
-      >
+      <div class="px-4 py-8 mx-auto max-w-2xl">
         {/* Header */}
         <header class="text-center mb-8">
           <h1 class="text-3xl font-bold text-gray-900 mb-2">
