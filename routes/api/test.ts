@@ -69,31 +69,45 @@ async function checkPort(
   }
 }
 
-function stripNonces(html: string): string {
-  return html
-    .replace(/nonce="[^"]*"/g, 'nonce=""')
-    .replace(/nonce='[^']*'/g, "nonce=''")
-    .replace(/\b[0-9a-f]{8,}\b/g, "HASH")
-    .replace(/\d{10,}/g, "TIMESTAMP");
+const SIMHASH_MAX_RESPONSE_SIZE = 500_000;
+const SIMHASH_MAX_DISTANCE = 10;
+
+function stripIrrelevantHtml(html: string): string {
+  // Strip nonces from script and style tags (matching internet.nl's approach)
+  let result = html.replace(
+    /<(script|style)([^>]*)\s+nonce=["'][^"']*["']([^>]*)>/gi,
+    "<$1$2$3>",
+  );
+  // Strip __VIEWSTATE hidden inputs (ASP.NET)
+  result = result.replace(
+    /<input[^>]*name=["']__VIEWSTATE["'][^>]*>/gi,
+    "",
+  );
+  return result;
 }
 
-function computeSimilarity(a: string, b: string): number {
-  if (a === b) return 100;
-  if (a.length === 0 && b.length === 0) return 100;
-  if (a.length === 0 || b.length === 0) return 0;
+function sequenceMatcherQuickRatio(a: string, b: string): number {
+  // Port of Python's SequenceMatcher.quick_ratio():
+  // Computes an upper bound on ratio() quickly by counting
+  // character frequencies rather than finding longest common subsequences.
+  if (a.length === 0 && b.length === 0) return 1.0;
+  if (a.length === 0 || b.length === 0) return 0.0;
 
-  const aLines = a.split("\n");
-  const bLines = b.split("\n");
-  const maxLen = Math.max(aLines.length, bLines.length);
-  if (maxLen === 0) return 100;
-
-  let matching = 0;
-  const minLen = Math.min(aLines.length, bLines.length);
-  for (let i = 0; i < minLen; i++) {
-    if (aLines[i] === bLines[i]) matching++;
+  const freqA = new Map<string, number>();
+  for (const ch of a) {
+    freqA.set(ch, (freqA.get(ch) || 0) + 1);
+  }
+  const freqB = new Map<string, number>();
+  for (const ch of b) {
+    freqB.set(ch, (freqB.get(ch) || 0) + 1);
   }
 
-  return Math.round((matching / maxLen) * 1000) / 10;
+  let matches = 0;
+  for (const [ch, countB] of freqB) {
+    matches += Math.min(freqA.get(ch) || 0, countB);
+  }
+
+  return (2.0 * matches) / (a.length + b.length);
 }
 
 interface ParsedResponse {
@@ -367,12 +381,28 @@ export const handler = define.handlers({
       https: { ipv4: https4, ipv6: https6, equal: https4 === https6 },
     };
 
-    // Fetch content via both protocols
-    const fetchProto = protocol === "http" ? "http" : "https";
-    const [resp4, resp6] = await Promise.all([
-      fetchViaIP(ipv4, hostname, fetchProto, false, followRedirects),
-      fetchViaIP(ipv6, hostname, fetchProto, true, followRedirects),
-    ]);
+    // Fetch content: try HTTP first, fall back to HTTPS (matching internet.nl)
+    // Try both protocols to find one that works on both address families
+    let resp4 = null;
+    let resp6 = null;
+    const protosToTry = protocol === "http"
+      ? ["http", "https"]
+      : ["https", "http"];
+
+    for (const proto of protosToTry) {
+      const [r4, r6] = await Promise.all([
+        fetchViaIP(ipv4, hostname, proto, false, followRedirects),
+        fetchViaIP(ipv6, hostname, proto, true, followRedirects),
+      ]);
+      if (r4 && r6) {
+        resp4 = r4;
+        resp6 = r6;
+        break;
+      }
+      // If one worked but not the other, keep trying next protocol
+      if (!resp4 && r4) resp4 = r4;
+      if (!resp6 && r6) resp6 = r6;
+    }
 
     if (resp4 && resp6) {
       result.headerComparison.ipv4StatusCode = resp4.status;
@@ -389,11 +419,20 @@ export const handler = define.handlers({
       }
       result.headerComparison.headerDiffs = headerDiffs;
 
-      const stripped4 = stripNonces(resp4.body);
-      const stripped6 = stripNonces(resp6.body);
-      const similarity = computeSimilarity(stripped4, stripped6);
-      result.contentComparison.similarityPercent = similarity;
-      result.contentComparison.pass = similarity >= 90;
+      // Cap response size and strip irrelevant HTML (matching internet.nl)
+      const html4 = stripIrrelevantHtml(
+        resp4.body.substring(0, SIMHASH_MAX_RESPONSE_SIZE),
+      );
+      const html6 = stripIrrelevantHtml(
+        resp6.body.substring(0, SIMHASH_MAX_RESPONSE_SIZE),
+      );
+
+      // Use SequenceMatcher quick_ratio (matching internet.nl's approach)
+      const ratio = sequenceMatcherQuickRatio(html4, html6);
+      const distance = 100 - ratio * 100;
+      const similarityPercent = Math.round(ratio * 1000) / 10;
+      result.contentComparison.similarityPercent = similarityPercent;
+      result.contentComparison.pass = distance <= SIMHASH_MAX_DISTANCE;
 
       result.followedRedirects = {
         ipv4: resp4.redirectChain,
@@ -403,7 +442,6 @@ export const handler = define.handlers({
       result.overallPass = result.portCheck.http.equal &&
         result.portCheck.https.equal &&
         result.headerComparison.statusEqual &&
-        headerDiffs.length === 0 &&
         result.contentComparison.pass;
     } else {
       result.error =

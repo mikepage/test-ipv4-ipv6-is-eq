@@ -408,8 +408,9 @@ export default function IPv6Test() {
                 </span>
               </div>
               <p class="mt-1 text-xs text-gray-500">
-                Content is compared after stripping nonces and dynamic tokens.
-                ≥90% similarity = pass.
+
+                Content compared after stripping nonces and VIEWSTATE tokens
+                (internet.nl method). ≤10% distance = pass.
               </p>
             </ResultCard>
           )}
