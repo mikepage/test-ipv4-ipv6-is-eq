@@ -78,7 +78,6 @@ async function checkPort(
 
 const SIMHASH_MAX_RESPONSE_SIZE = 500_000;
 const SIMHASH_MAX_DISTANCE = 10;
-const CONNECT_TIMEOUT = 10_000;
 
 function stripIrrelevantHtml(html: string): string {
   let result = html.replace(
@@ -128,36 +127,17 @@ interface FetchResult {
   redirectChain: string[];
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
-    ),
-  ]);
-}
-
-async function rawHttpRequest(
+// Raw HTTP/1.1 over plain TCP — works on Deno Deploy (no startTls needed)
+async function rawHttpGet(
   ip: string,
-  port: number,
   hostname: string,
   path: string,
-  useTls: boolean,
 ): Promise<{ status: number; headers: Headers; body: string }> {
-  const conn = await withTimeout(
-    Deno.connect({ hostname: ip, port, transport: "tcp" }),
-    CONNECT_TIMEOUT,
-  );
-
-  let stream: Deno.Conn;
-  if (useTls) {
-    stream = await withTimeout(
-      Deno.startTls(conn as Deno.TcpConn, { hostname }),
-      CONNECT_TIMEOUT,
-    );
-  } else {
-    stream = conn;
-  }
+  const conn = await Deno.connect({
+    hostname: ip,
+    port: 80,
+    transport: "tcp",
+  });
 
   const request = `GET ${path} HTTP/1.1\r\n` +
     `Host: ${hostname}\r\n` +
@@ -167,13 +147,13 @@ async function rawHttpRequest(
     `Connection: close\r\n` +
     `\r\n`;
 
-  const writer = stream.writable.getWriter();
+  const writer = conn.writable.getWriter();
   await writer.write(new TextEncoder().encode(request));
   await writer.close();
 
   const chunks: Uint8Array[] = [];
   let totalLen = 0;
-  const reader = stream.readable.getReader();
+  const reader = conn.readable.getReader();
   while (totalLen < SIMHASH_MAX_RESPONSE_SIZE + 65536) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -233,28 +213,17 @@ async function rawHttpRequest(
 async function fetchViaIP(
   ip: string,
   hostname: string,
-  protocol: string,
   followRedirects: boolean,
 ): Promise<FetchResult | string> {
   const redirectChain: string[] = [];
   let currentHostname = hostname;
   let currentPath = "/";
-  let currentProtocol = protocol;
   let currentIp = ip;
   const maxRedirects = followRedirects ? 10 : 0;
 
   for (let i = 0; i <= maxRedirects; i++) {
-    const useTls = currentProtocol === "https";
-    const port = useTls ? 443 : 80;
-
     try {
-      const resp = await rawHttpRequest(
-        currentIp,
-        port,
-        currentHostname,
-        currentPath,
-        useTls,
-      );
+      const resp = await rawHttpGet(currentIp, currentHostname, currentPath);
 
       if (
         followRedirects && resp.status >= 300 && resp.status < 400 &&
@@ -262,6 +231,7 @@ async function fetchViaIP(
       ) {
         const location = resp.headers.get("location")!;
         redirectChain.push(location);
+
         if (location.startsWith("http")) {
           const u = new URL(location);
           if (u.hostname !== currentHostname) {
@@ -275,8 +245,7 @@ async function fetchViaIP(
             }
             currentIp = newIp;
           }
-          currentProtocol = u.protocol.replace(":", "");
-          currentPath = u.pathname + u.search;
+          currentPath = u.pathname + u.search || "/";
         } else {
           currentPath = location;
         }
@@ -321,13 +290,11 @@ export const handler = define.handlers({
     }
 
     let hostname: string;
-    let protocol: string;
     try {
       const parsed = new URL(
         url.startsWith("http") ? url : `https://${url}`,
       );
       hostname = parsed.hostname;
-      protocol = parsed.protocol.replace(":", "");
     } catch {
       return Response.json({ error: "Invalid URL" }, { status: 400 });
     }
@@ -393,10 +360,11 @@ export const handler = define.handlers({
       https: { ipv4: https4, ipv6: https6, equal: https4 === https6 },
     };
 
-    // Fetch content via both address families
+    // Fetch content over HTTP (port 80) via raw TCP to specific IPs
+    // This avoids Deno Deploy's startTls limitation
     const [r4, r6] = await Promise.all([
-      fetchViaIP(ipv4, hostname, protocol, followRedirects),
-      fetchViaIP(ipv6, hostname, protocol, followRedirects),
+      fetchViaIP(ipv4, hostname, followRedirects),
+      fetchViaIP(ipv6, hostname, followRedirects),
     ]);
 
     const resp4 = typeof r4 === "string" ? null : r4;
