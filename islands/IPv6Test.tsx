@@ -12,6 +12,11 @@ interface HeaderDiff {
   ipv6Value: string | null;
 }
 
+interface HeaderEntry {
+  name: string;
+  value: string;
+}
+
 interface TestResult {
   url: string;
   hostname: string;
@@ -26,6 +31,8 @@ interface TestResult {
     ipv6StatusCode: number | null;
     statusEqual: boolean;
     headerDiffs: HeaderDiff[];
+    ipv4Headers: HeaderEntry[];
+    ipv6Headers: HeaderEntry[];
   };
   contentComparison: {
     similarityPercent: number | null;
@@ -94,13 +101,41 @@ function ShimmerCard() {
   );
 }
 
+function HeaderTable(
+  { headers, label }: { headers: HeaderEntry[]; label: string },
+) {
+  if (headers.length === 0) return null;
+  return (
+    <div>
+      <div class="font-medium text-gray-700 mb-1">{label}</div>
+      <div class="bg-gray-50 rounded p-2 overflow-x-auto max-h-48 overflow-y-auto">
+        <table class="w-full text-xs">
+          <tbody>
+            {headers.map((h, i) => (
+              <tr key={i} class="border-b border-gray-100 last:border-0">
+                <td class="py-0.5 pr-2 font-mono font-medium text-gray-700 whitespace-nowrap align-top">
+                  {h.name}
+                </td>
+                <td class="py-0.5 font-mono break-all text-gray-500">
+                  {h.value}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 export default function IPv6Test() {
   const url = useSignal("");
   const followRedirects = useSignal(false);
   const loading = useSignal(false);
   const result = useSignal<TestResult | null>(null);
   const error = useSignal<string | null>(null);
-  const expandedHeaders = useSignal(false);
+  const showHeaders = useSignal(false);
+  const expandedDiffs = useSignal(false);
 
   async function runTest() {
     const testUrl = url.value.trim();
@@ -109,6 +144,8 @@ export default function IPv6Test() {
     loading.value = true;
     result.value = null;
     error.value = null;
+    showHeaders.value = false;
+    expandedDiffs.value = false;
 
     try {
       const params = new URLSearchParams({
@@ -330,16 +367,16 @@ export default function IPv6Test() {
                   <div>
                     <button
                       onClick={() =>
-                        expandedHeaders.value = !expandedHeaders.value}
+                        expandedDiffs.value = !expandedDiffs.value}
                       class="text-blue-600 hover:text-blue-800 text-sm font-medium"
                     >
-                      {expandedHeaders.value ? "Hide" : "Show"}{" "}
+                      {expandedDiffs.value ? "Hide" : "Show"}{" "}
                       {r.headerComparison.headerDiffs.length} header{" "}
                       {r.headerComparison.headerDiffs.length === 1
                         ? "difference"
                         : "differences"}
                     </button>
-                    {expandedHeaders.value && (
+                    {expandedDiffs.value && (
                       <div class="mt-2 overflow-x-auto">
                         <table class="w-full text-left text-xs">
                           <thead>
@@ -378,6 +415,30 @@ export default function IPv6Test() {
                     All compared headers match.
                   </p>
                 )}
+
+                {/* Full headers toggle */}
+                <div>
+                  <button
+                    onClick={() => showHeaders.value = !showHeaders.value}
+                    class="text-blue-600 hover:text-blue-800 text-sm font-medium"
+                  >
+                    {showHeaders.value
+                      ? "Hide full headers"
+                      : "Show full headers"}
+                  </button>
+                  {showHeaders.value && (
+                    <div class="mt-3 grid grid-cols-1 gap-4">
+                      <HeaderTable
+                        headers={r.headerComparison.ipv4Headers}
+                        label={`IPv4 (${r.headerComparison.ipv4StatusCode})`}
+                      />
+                      <HeaderTable
+                        headers={r.headerComparison.ipv6Headers}
+                        label={`IPv6 (${r.headerComparison.ipv6StatusCode})`}
+                      />
+                    </div>
+                  )}
+                </div>
               </div>
             </ResultCard>
           )}
@@ -408,7 +469,6 @@ export default function IPv6Test() {
                 </span>
               </div>
               <p class="mt-1 text-xs text-gray-500">
-
                 Content compared after stripping nonces and VIEWSTATE tokens
                 (internet.nl method). ≤10% distance = pass.
               </p>
