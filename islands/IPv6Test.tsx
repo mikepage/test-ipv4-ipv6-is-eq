@@ -39,10 +39,6 @@ interface TestResult {
     similarityPercent: number | null;
     pass: boolean;
   };
-  followedRedirects: {
-    ipv4: string[];
-    ipv6: string[];
-  };
   connectedAddresses: {
     ipv4: string | null;
     ipv6: string | null;
@@ -146,7 +142,6 @@ function HeaderTable(
 
 export default function IPv6Test() {
   const url = useSignal("");
-  const followRedirects = useSignal(false);
   const loading = useSignal(false);
   const result = useSignal<TestResult | null>(null);
   const error = useSignal<string | null>(null);
@@ -161,14 +156,13 @@ export default function IPv6Test() {
     }
   }
 
-  // Sync hash → state on mount and hashchange
+  // Sync hash -> state on mount and hashchange
   useEffect(() => {
     let mounted = true;
     const handleHash = () => {
       const hash = window.location.hash.replace(/^#/, "").trim();
       if (hash && mounted) {
         url.value = hash;
-        // Auto-run test on initial load with hash
         setTimeout(() => {
           if (mounted && url.value === hash) runTest();
         }, 0);
@@ -186,7 +180,6 @@ export default function IPv6Test() {
     const testUrl = url.value.trim();
     if (!testUrl) return;
 
-    // Update hash when running a test
     updateHash(testUrl);
 
     loading.value = true;
@@ -196,10 +189,7 @@ export default function IPv6Test() {
     expandedDiffs.value = false;
 
     try {
-      const params = new URLSearchParams({
-        url: testUrl,
-        followRedirects: String(followRedirects.value),
-      });
+      const params = new URLSearchParams({ url: testUrl });
       const resp = await fetch(`/api/test?${params}`);
       const data = await resp.json();
 
@@ -221,47 +211,26 @@ export default function IPv6Test() {
     <div class="w-full max-w-2xl mx-auto">
       {/* Input form */}
       <div class="bg-white rounded-lg shadow p-6 mb-6">
-        <div class="flex flex-col gap-4">
-          <div>
-            <label
-              class="block text-sm font-medium text-gray-700 mb-1"
-              for="url-input"
-            >
-              Website URL
-            </label>
-            <input
-              id="url-input"
-              type="text"
-              placeholder="e.g. google.com"
-              value={url.value}
-              onInput={(e) =>
-                url.value = (e.target as HTMLInputElement).value}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") runTest();
-              }}
-              class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none font-mono text-sm"
-            />
-          </div>
-          <div class="flex items-center justify-between">
-            <label class="flex items-center gap-2 text-sm text-gray-600 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={followRedirects.value}
-                onChange={(e) =>
-                  followRedirects.value =
-                    (e.target as HTMLInputElement).checked}
-                class="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-              />
-              Follow redirects
-            </label>
-            <button
-              onClick={runTest}
-              disabled={loading.value || !isValidUrl(url.value)}
-              class="px-6 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              {loading.value ? "Testing..." : "Run Test"}
-            </button>
-          </div>
+        <div class="flex gap-3">
+          <input
+            id="url-input"
+            type="text"
+            placeholder="e.g. google.com"
+            value={url.value}
+            onInput={(e) =>
+              url.value = (e.target as HTMLInputElement).value}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") runTest();
+            }}
+            class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none font-mono text-sm"
+          />
+          <button
+            onClick={runTest}
+            disabled={loading.value || !isValidUrl(url.value)}
+            class="px-6 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {loading.value ? "Testing..." : "Run Test"}
+          </button>
         </div>
       </div>
 
@@ -548,43 +517,6 @@ export default function IPv6Test() {
                 Content compared after stripping nonces and VIEWSTATE tokens
                 (internet.nl method). ≤10% distance = pass.
               </p>
-            </ResultCard>
-          )}
-
-          {/* Followed Redirects */}
-          {(r.followedRedirects.ipv4.length > 0 ||
-            r.followedRedirects.ipv6.length > 0) && (
-            <ResultCard
-              title="Redirect Chain"
-              status={JSON.stringify(r.followedRedirects.ipv4) ===
-                  JSON.stringify(r.followedRedirects.ipv6)
-                ? "pass"
-                : "warn"}
-            >
-              <div class="grid grid-cols-2 gap-4">
-                <div>
-                  <div class="font-medium text-gray-700 mb-1">IPv4</div>
-                  {r.followedRedirects.ipv4.map((u, i) => (
-                    <div key={i} class="font-mono text-xs truncate">
-                      → {u}
-                    </div>
-                  ))}
-                  {r.followedRedirects.ipv4.length === 0 && (
-                    <div class="text-gray-400">No redirects</div>
-                  )}
-                </div>
-                <div>
-                  <div class="font-medium text-gray-700 mb-1">IPv6</div>
-                  {r.followedRedirects.ipv6.map((u, i) => (
-                    <div key={i} class="font-mono text-xs truncate">
-                      → {u}
-                    </div>
-                  ))}
-                  {r.followedRedirects.ipv6.length === 0 && (
-                    <div class="text-gray-400">No redirects</div>
-                  )}
-                </div>
-              </div>
             </ResultCard>
           )}
         </div>

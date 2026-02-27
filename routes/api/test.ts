@@ -38,10 +38,6 @@ interface TestResult {
     similarityPercent: number | null;
     pass: boolean;
   };
-  followedRedirects: {
-    ipv4: string[];
-    ipv6: string[];
-  };
   connectedAddresses: {
     ipv4: string | null;
     ipv6: string | null;
@@ -128,174 +124,109 @@ interface FetchResult {
   status: number;
   headers: Headers;
   body: string;
-  redirectChain: string[];
   connectedAddress: string;
-}
-
-// Raw HTTP/1.1 over plain TCP using legacy read/write APIs
-// (Deno Deploy doesn't support ReadableStream/WritableStream on TcpConn)
-async function rawHttpGet(
-  ip: string,
-  hostname: string,
-  path: string,
-): Promise<{
-  status: number;
-  headers: Headers;
-  body: string;
-  connectedAddress: string;
-}> {
-  const conn = await Deno.connect({
-    hostname: ip,
-    port: 80,
-    transport: "tcp",
-  });
-  const remoteAddr = conn.remoteAddr as Deno.NetAddr;
-  const connectedAddress = `${remoteAddr.hostname}:${remoteAddr.port}`;
-
-  try {
-    const request = `GET ${path} HTTP/1.1\r\n` +
-      `Host: ${hostname}\r\n` +
-      `User-Agent: Mozilla/5.0 (compatible; IPv6EqualityTest/1.0)\r\n` +
-      `Accept: */*\r\n` +
-      `Accept-Encoding: identity\r\n` +
-      `Connection: close\r\n` +
-      `\r\n`;
-
-    // Write request using legacy API
-    const encoded = new TextEncoder().encode(request);
-    let written = 0;
-    while (written < encoded.length) {
-      written += await conn.write(encoded.subarray(written));
-    }
-
-    // Signal we're done writing (half-close)
-    try {
-      await conn.closeWrite();
-    } catch {
-      // closeWrite may not be available, proceed anyway
-    }
-
-    // Read response using legacy API
-    const chunks: Uint8Array[] = [];
-    let totalLen = 0;
-    const buf = new Uint8Array(32768);
-    while (totalLen < SIMHASH_MAX_RESPONSE_SIZE + 65536) {
-      const n = await conn.read(buf);
-      if (n === null) break;
-      chunks.push(buf.slice(0, n));
-      totalLen += n;
-    }
-
-    const combined = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const chunk of chunks) {
-      combined.set(chunk, offset);
-      offset += chunk.length;
-    }
-
-    const raw = new TextDecoder("utf-8", { fatal: false }).decode(combined);
-    const headerEnd = raw.indexOf("\r\n\r\n");
-    if (headerEnd === -1) throw new Error("No header boundary in response");
-
-    const headerSection = raw.substring(0, headerEnd);
-    const bodyRaw = raw.substring(headerEnd + 4);
-    const headerLines = headerSection.split("\r\n");
-    const statusMatch = headerLines[0].match(/^HTTP\/[\d.]+ (\d+)/);
-    if (!statusMatch) throw new Error("Bad status line: " + headerLines[0]);
-
-    const status = parseInt(statusMatch[1]);
-    const headers = new Headers();
-    for (let j = 1; j < headerLines.length; j++) {
-      const colonIdx = headerLines[j].indexOf(":");
-      if (colonIdx > 0) {
-        headers.append(
-          headerLines[j].substring(0, colonIdx).trim(),
-          headerLines[j].substring(colonIdx + 1).trim(),
-        );
-      }
-    }
-
-    let body: string;
-    if (headers.get("transfer-encoding")?.includes("chunked")) {
-      body = "";
-      let pos = 0;
-      while (pos < bodyRaw.length) {
-        const lineEnd = bodyRaw.indexOf("\r\n", pos);
-        if (lineEnd === -1) break;
-        const size = parseInt(bodyRaw.substring(pos, lineEnd).trim(), 16);
-        if (isNaN(size) || size === 0) break;
-        body += bodyRaw.substring(lineEnd + 2, lineEnd + 2 + size);
-        pos = lineEnd + 2 + size + 2;
-      }
-    } else {
-      body = bodyRaw;
-    }
-
-    return { status, headers, body, connectedAddress };
-  } finally {
-    try {
-      conn.close();
-    } catch {
-      // already closed
-    }
-  }
 }
 
 async function fetchViaIP(
   ip: string,
   hostname: string,
-  followRedirects: boolean,
 ): Promise<FetchResult | string> {
-  const redirectChain: string[] = [];
-  let currentHostname = hostname;
-  let currentPath = "/";
-  let currentIp = ip;
-  const maxRedirects = followRedirects ? 10 : 0;
+  try {
+    const conn = await Deno.connect({
+      hostname: ip,
+      port: 80,
+      transport: "tcp",
+    });
+    const remoteAddr = conn.remoteAddr as Deno.NetAddr;
+    const connectedAddress = `${remoteAddr.hostname}:${remoteAddr.port}`;
 
-  for (let i = 0; i <= maxRedirects; i++) {
     try {
-      const resp = await rawHttpGet(currentIp, currentHostname, currentPath);
+      const request = `GET / HTTP/1.1\r\n` +
+        `Host: ${hostname}\r\n` +
+        `User-Agent: Mozilla/5.0 (compatible; IPv6EqualityTest/1.0)\r\n` +
+        `Accept: */*\r\n` +
+        `Accept-Encoding: identity\r\n` +
+        `Connection: close\r\n` +
+        `\r\n`;
 
-      if (
-        followRedirects && resp.status >= 300 && resp.status < 400 &&
-        resp.headers.has("location")
-      ) {
-        const location = resp.headers.get("location")!;
-        redirectChain.push(location);
-
-        if (location.startsWith("http")) {
-          const u = new URL(location);
-          if (u.hostname !== currentHostname) {
-            currentHostname = u.hostname;
-            const newIp = await resolveDns(
-              currentHostname,
-              ip.includes(":") ? "AAAA" : "A",
-            );
-            if (!newIp) {
-              return `DNS re-resolve failed for ${currentHostname}`;
-            }
-            currentIp = newIp;
-          }
-          currentPath = u.pathname + u.search || "/";
-        } else {
-          currentPath = location;
-        }
-        continue;
+      const encoded = new TextEncoder().encode(request);
+      let written = 0;
+      while (written < encoded.length) {
+        written += await conn.write(encoded.subarray(written));
       }
 
-      return {
-        status: resp.status,
-        headers: resp.headers,
-        body: resp.body,
-        redirectChain,
-        connectedAddress: resp.connectedAddress,
-      };
-    } catch (e) {
-      return e instanceof Error ? e.message : String(e);
-    }
-  }
+      try {
+        await conn.closeWrite();
+      } catch {
+        // closeWrite may not be available
+      }
 
-  return "Too many redirects";
+      const chunks: Uint8Array[] = [];
+      let totalLen = 0;
+      const buf = new Uint8Array(32768);
+      while (totalLen < SIMHASH_MAX_RESPONSE_SIZE + 65536) {
+        const n = await conn.read(buf);
+        if (n === null) break;
+        chunks.push(buf.slice(0, n));
+        totalLen += n;
+      }
+
+      const combined = new Uint8Array(totalLen);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      const raw = new TextDecoder("utf-8", { fatal: false }).decode(combined);
+      const headerEnd = raw.indexOf("\r\n\r\n");
+      if (headerEnd === -1) throw new Error("No header boundary in response");
+
+      const headerSection = raw.substring(0, headerEnd);
+      const bodyRaw = raw.substring(headerEnd + 4);
+      const headerLines = headerSection.split("\r\n");
+      const statusMatch = headerLines[0].match(/^HTTP\/[\d.]+ (\d+)/);
+      if (!statusMatch) throw new Error("Bad status line: " + headerLines[0]);
+
+      const status = parseInt(statusMatch[1]);
+      const headers = new Headers();
+      for (let j = 1; j < headerLines.length; j++) {
+        const colonIdx = headerLines[j].indexOf(":");
+        if (colonIdx > 0) {
+          headers.append(
+            headerLines[j].substring(0, colonIdx).trim(),
+            headerLines[j].substring(colonIdx + 1).trim(),
+          );
+        }
+      }
+
+      let body: string;
+      if (headers.get("transfer-encoding")?.includes("chunked")) {
+        body = "";
+        let pos = 0;
+        while (pos < bodyRaw.length) {
+          const lineEnd = bodyRaw.indexOf("\r\n", pos);
+          if (lineEnd === -1) break;
+          const size = parseInt(bodyRaw.substring(pos, lineEnd).trim(), 16);
+          if (isNaN(size) || size === 0) break;
+          body += bodyRaw.substring(lineEnd + 2, lineEnd + 2 + size);
+          pos = lineEnd + 2 + size + 2;
+        }
+      } else {
+        body = bodyRaw;
+      }
+
+      return { status, headers, body, connectedAddress };
+    } finally {
+      try {
+        conn.close();
+      } catch {
+        // already closed
+      }
+    }
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
 }
 
 const COMPARE_HEADERS = [
@@ -312,8 +243,6 @@ const COMPARE_HEADERS = [
 export const handler = define.handlers({
   async GET(ctx) {
     const url = ctx.url.searchParams.get("url");
-    const followRedirects =
-      ctx.url.searchParams.get("followRedirects") === "true";
 
     if (!url) {
       return Response.json({ error: "url parameter required" }, {
@@ -357,10 +286,6 @@ export const handler = define.handlers({
         similarityPercent: null,
         pass: false,
       },
-      followedRedirects: {
-        ipv4: [],
-        ipv6: [],
-      },
       connectedAddresses: {
         ipv4: null,
         ipv6: null,
@@ -397,10 +322,9 @@ export const handler = define.handlers({
     };
 
     // Fetch content over HTTP (port 80) via raw TCP to specific IPs
-    // This avoids Deno Deploy's startTls limitation
     const [r4, r6] = await Promise.all([
-      fetchViaIP(ipv4, hostname, followRedirects),
-      fetchViaIP(ipv6, hostname, followRedirects),
+      fetchViaIP(ipv4, hostname),
+      fetchViaIP(ipv6, hostname),
     ]);
 
     const resp4 = typeof r4 === "string" ? null : r4;
@@ -440,11 +364,6 @@ export const handler = define.handlers({
       const similarityPercent = Math.round(ratio * 1000) / 10;
       result.contentComparison.similarityPercent = similarityPercent;
       result.contentComparison.pass = distance <= SIMHASH_MAX_DISTANCE;
-
-      result.followedRedirects = {
-        ipv4: resp4.redirectChain,
-        ipv6: resp6.redirectChain,
-      };
 
       result.overallPass = result.portCheck.http.equal &&
         result.portCheck.https.equal &&
