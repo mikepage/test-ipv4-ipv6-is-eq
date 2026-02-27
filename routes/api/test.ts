@@ -44,6 +44,7 @@ interface TestResult {
   };
   overallPass: boolean;
   error?: string;
+  debug?: { ipv4Error?: string; ipv6Error?: string };
 }
 
 async function resolveDns(
@@ -77,6 +78,7 @@ async function checkPort(
 
 const SIMHASH_MAX_RESPONSE_SIZE = 500_000;
 const SIMHASH_MAX_DISTANCE = 10;
+const CONNECT_TIMEOUT = 10_000;
 
 function stripIrrelevantHtml(html: string): string {
   let result = html.replace(
@@ -126,13 +128,114 @@ interface FetchResult {
   redirectChain: string[];
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
+async function rawHttpRequest(
+  ip: string,
+  port: number,
+  hostname: string,
+  path: string,
+  useTls: boolean,
+): Promise<{ status: number; headers: Headers; body: string }> {
+  const conn = await withTimeout(
+    Deno.connect({ hostname: ip, port, transport: "tcp" }),
+    CONNECT_TIMEOUT,
+  );
+
+  let stream: Deno.Conn;
+  if (useTls) {
+    stream = await withTimeout(
+      Deno.startTls(conn as Deno.TcpConn, { hostname }),
+      CONNECT_TIMEOUT,
+    );
+  } else {
+    stream = conn;
+  }
+
+  const request = `GET ${path} HTTP/1.1\r\n` +
+    `Host: ${hostname}\r\n` +
+    `User-Agent: Mozilla/5.0 (compatible; IPv6EqualityTest/1.0)\r\n` +
+    `Accept: */*\r\n` +
+    `Accept-Encoding: identity\r\n` +
+    `Connection: close\r\n` +
+    `\r\n`;
+
+  const writer = stream.writable.getWriter();
+  await writer.write(new TextEncoder().encode(request));
+  await writer.close();
+
+  const chunks: Uint8Array[] = [];
+  let totalLen = 0;
+  const reader = stream.readable.getReader();
+  while (totalLen < SIMHASH_MAX_RESPONSE_SIZE + 65536) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    totalLen += value.length;
+  }
+  reader.releaseLock();
+
+  const combined = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  const raw = new TextDecoder("utf-8", { fatal: false }).decode(combined);
+  const headerEnd = raw.indexOf("\r\n\r\n");
+  if (headerEnd === -1) throw new Error("No header boundary in response");
+
+  const headerSection = raw.substring(0, headerEnd);
+  const bodyRaw = raw.substring(headerEnd + 4);
+  const headerLines = headerSection.split("\r\n");
+  const statusMatch = headerLines[0].match(/^HTTP\/[\d.]+ (\d+)/);
+  if (!statusMatch) throw new Error("Bad status line: " + headerLines[0]);
+
+  const status = parseInt(statusMatch[1]);
+  const headers = new Headers();
+  for (let j = 1; j < headerLines.length; j++) {
+    const colonIdx = headerLines[j].indexOf(":");
+    if (colonIdx > 0) {
+      headers.append(
+        headerLines[j].substring(0, colonIdx).trim(),
+        headerLines[j].substring(colonIdx + 1).trim(),
+      );
+    }
+  }
+
+  let body: string;
+  if (headers.get("transfer-encoding")?.includes("chunked")) {
+    body = "";
+    let pos = 0;
+    while (pos < bodyRaw.length) {
+      const lineEnd = bodyRaw.indexOf("\r\n", pos);
+      if (lineEnd === -1) break;
+      const size = parseInt(bodyRaw.substring(pos, lineEnd).trim(), 16);
+      if (isNaN(size) || size === 0) break;
+      body += bodyRaw.substring(lineEnd + 2, lineEnd + 2 + size);
+      pos = lineEnd + 2 + size + 2;
+    }
+  } else {
+    body = bodyRaw;
+  }
+
+  return { status, headers, body };
+}
+
 async function fetchViaIP(
   ip: string,
   hostname: string,
   protocol: string,
-  isIPv6: boolean,
   followRedirects: boolean,
-): Promise<FetchResult | null> {
+): Promise<FetchResult | string> {
   const redirectChain: string[] = [];
   let currentHostname = hostname;
   let currentPath = "/";
@@ -144,136 +247,14 @@ async function fetchViaIP(
     const useTls = currentProtocol === "https";
     const port = useTls ? 443 : 80;
 
-    // Strategy 1: Raw TCP (works on Deno CLI, may fail on Deploy)
     try {
-      const conn = await Deno.connect({
-        hostname: currentIp,
+      const resp = await rawHttpRequest(
+        currentIp,
         port,
-        transport: "tcp",
-      });
-      const tlsConn = useTls
-        ? await Deno.startTls(conn, { hostname: currentHostname })
-        : conn;
-
-      const request = `GET ${currentPath} HTTP/1.1\r\n` +
-        `Host: ${currentHostname}\r\n` +
-        `User-Agent: Mozilla/5.0 (compatible; IPv6EqualityTest/1.0)\r\n` +
-        `Accept: */*\r\n` +
-        `Connection: close\r\n` +
-        `\r\n`;
-
-      const writer = tlsConn.writable.getWriter();
-      await writer.write(new TextEncoder().encode(request));
-      await writer.close();
-
-      const chunks: Uint8Array[] = [];
-      const reader = tlsConn.readable.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-      }
-
-      const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);
-      const combined = new Uint8Array(totalLen);
-      let offset = 0;
-      for (const chunk of chunks) {
-        combined.set(chunk, offset);
-        offset += chunk.length;
-      }
-
-      const raw = new TextDecoder().decode(combined);
-      const headerEnd = raw.indexOf("\r\n\r\n");
-      if (headerEnd === -1) throw new Error("No header boundary");
-
-      const headerSection = raw.substring(0, headerEnd);
-      const bodyRaw = raw.substring(headerEnd + 4);
-      const headerLines = headerSection.split("\r\n");
-      const statusMatch = headerLines[0].match(/^HTTP\/[\d.]+ (\d+)/);
-      if (!statusMatch) throw new Error("Bad status line");
-
-      const status = parseInt(statusMatch[1]);
-      const headers = new Headers();
-      for (let j = 1; j < headerLines.length; j++) {
-        const colonIdx = headerLines[j].indexOf(":");
-        if (colonIdx > 0) {
-          headers.append(
-            headerLines[j].substring(0, colonIdx).trim(),
-            headerLines[j].substring(colonIdx + 1).trim(),
-          );
-        }
-      }
-
-      let body: string;
-      if (headers.get("transfer-encoding")?.includes("chunked")) {
-        body = "";
-        let pos = 0;
-        while (pos < bodyRaw.length) {
-          const lineEnd = bodyRaw.indexOf("\r\n", pos);
-          if (lineEnd === -1) break;
-          const size = parseInt(bodyRaw.substring(pos, lineEnd).trim(), 16);
-          if (isNaN(size) || size === 0) break;
-          body += bodyRaw.substring(lineEnd + 2, lineEnd + 2 + size);
-          pos = lineEnd + 2 + size + 2;
-        }
-      } else {
-        body = bodyRaw;
-      }
-
-      if (
-        followRedirects && status >= 300 && status < 400 &&
-        headers.has("location")
-      ) {
-        const location = headers.get("location")!;
-        redirectChain.push(location);
-        if (location.startsWith("http")) {
-          const u = new URL(location);
-          if (u.hostname !== currentHostname) {
-            currentHostname = u.hostname;
-            const newIp = await resolveDns(
-              currentHostname,
-              ip.includes(":") ? "AAAA" : "A",
-            );
-            if (!newIp) return null;
-            currentIp = newIp;
-          }
-          currentProtocol = u.protocol.replace(":", "");
-          currentPath = u.pathname + u.search;
-        } else {
-          currentPath = location;
-        }
-        continue;
-      }
-
-      return { status, headers, body, redirectChain };
-    } catch {
-      // Strategy 1 failed, try Strategy 2
-    }
-
-    // Strategy 2: fetch() to IP — works for HTTP, HTTPS needs hostname
-    try {
-      let fetchUrl: string;
-      const fetchHeaders: Record<string, string> = {
-        "User-Agent": "Mozilla/5.0 (compatible; IPv6EqualityTest/1.0)",
-      };
-
-      if (useTls) {
-        // For HTTPS we can't fetch by IP (TLS cert mismatch), but we can
-        // use HTTP to the IP instead to compare content
-        const host = isIPv6 ? `[${currentIp}]` : currentIp;
-        fetchUrl = `http://${host}${currentPath}`;
-        fetchHeaders["Host"] = currentHostname;
-      } else {
-        const host = isIPv6 ? `[${currentIp}]` : currentIp;
-        fetchUrl = `http://${host}${currentPath}`;
-        fetchHeaders["Host"] = currentHostname;
-      }
-
-      const resp = await fetch(fetchUrl, {
-        headers: fetchHeaders,
-        redirect: "manual",
-      });
-      const body = await resp.text();
+        currentHostname,
+        currentPath,
+        useTls,
+      );
 
       if (
         followRedirects && resp.status >= 300 && resp.status < 400 &&
@@ -289,7 +270,9 @@ async function fetchViaIP(
               currentHostname,
               ip.includes(":") ? "AAAA" : "A",
             );
-            if (!newIp) return null;
+            if (!newIp) {
+              return `DNS re-resolve failed for ${currentHostname}`;
+            }
             currentIp = newIp;
           }
           currentProtocol = u.protocol.replace(":", "");
@@ -303,15 +286,15 @@ async function fetchViaIP(
       return {
         status: resp.status,
         headers: resp.headers,
-        body,
+        body: resp.body,
         redirectChain,
       };
-    } catch {
-      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
     }
   }
 
-  return null;
+  return "Too many redirects";
 }
 
 const COMPARE_HEADERS = [
@@ -410,26 +393,16 @@ export const handler = define.handlers({
       https: { ipv4: https4, ipv6: https6, equal: https4 === https6 },
     };
 
-    // Fetch content: try preferred protocol first, fall back to other
-    let resp4: FetchResult | null = null;
-    let resp6: FetchResult | null = null;
-    const protosToTry = protocol === "http"
-      ? ["http", "https"]
-      : ["https", "http"];
+    // Fetch content via both address families
+    const [r4, r6] = await Promise.all([
+      fetchViaIP(ipv4, hostname, protocol, followRedirects),
+      fetchViaIP(ipv6, hostname, protocol, followRedirects),
+    ]);
 
-    for (const proto of protosToTry) {
-      const [r4, r6] = await Promise.all([
-        fetchViaIP(ipv4, hostname, proto, false, followRedirects),
-        fetchViaIP(ipv6, hostname, proto, true, followRedirects),
-      ]);
-      if (r4 && r6) {
-        resp4 = r4;
-        resp6 = r6;
-        break;
-      }
-      if (!resp4 && r4) resp4 = r4;
-      if (!resp6 && r6) resp6 = r6;
-    }
+    const resp4 = typeof r4 === "string" ? null : r4;
+    const resp6 = typeof r6 === "string" ? null : r6;
+    const err4 = typeof r4 === "string" ? r4 : null;
+    const err6 = typeof r6 === "string" ? r6 : null;
 
     if (resp4 && resp6) {
       result.headerComparison.ipv4StatusCode = resp4.status;
@@ -471,8 +444,13 @@ export const handler = define.handlers({
         result.headerComparison.statusEqual &&
         result.contentComparison.pass;
     } else {
-      result.error =
-        `Could not fetch content: IPv4 ${resp4 ? "OK" : "failed"}, IPv6 ${resp6 ? "OK" : "failed"}`;
+      const parts = [];
+      parts.push(`IPv4 ${resp4 ? "OK" : "failed"}`);
+      parts.push(`IPv6 ${resp6 ? "OK" : "failed"}`);
+      result.error = `Could not fetch content: ${parts.join(", ")}`;
+      result.debug = {};
+      if (err4) result.debug.ipv4Error = err4;
+      if (err6) result.debug.ipv6Error = err6;
     }
 
     return Response.json(result);

@@ -44,6 +44,17 @@ interface TestResult {
   };
   overallPass: boolean;
   error?: string;
+  debug?: { ipv4Error?: string; ipv6Error?: string };
+}
+
+function isValidUrl(input: string): boolean {
+  if (!input.trim()) return false;
+  try {
+    new URL(input.startsWith("http") ? input : `https://${input}`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function StatusIcon({ status }: { status: "pass" | "warn" | "fail" }) {
@@ -208,7 +219,7 @@ export default function IPv6Test() {
             </label>
             <button
               onClick={runTest}
-              disabled={loading.value || !url.value.trim()}
+              disabled={loading.value || !isValidUrl(url.value)}
               class="px-6 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               {loading.value ? "Testing..." : "Run Test"}
@@ -253,6 +264,24 @@ export default function IPv6Test() {
               ? r.error
               : "FAIL — Differences detected between IPv4 and IPv6"}
           </div>
+
+          {/* Debug errors */}
+          {r.debug && (r.debug.ipv4Error || r.debug.ipv6Error) && (
+            <div class="bg-gray-50 border border-gray-200 rounded-lg p-4 text-xs font-mono text-gray-600 space-y-1">
+              {r.debug.ipv4Error && (
+                <div>
+                  <span class="font-semibold">IPv4:</span>{" "}
+                  {r.debug.ipv4Error}
+                </div>
+              )}
+              {r.debug.ipv6Error && (
+                <div>
+                  <span class="font-semibold">IPv6:</span>{" "}
+                  {r.debug.ipv6Error}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* DNS Resolution */}
           <ResultCard
