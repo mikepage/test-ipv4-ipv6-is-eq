@@ -1,4 +1,5 @@
 import { useSignal } from "@preact/signals";
+import { useEffect } from "preact/hooks";
 
 interface PortResult {
   ipv4: boolean;
@@ -148,9 +149,41 @@ export default function IPv6Test() {
   const showHeaders = useSignal(false);
   const expandedDiffs = useSignal(false);
 
+  function updateHash(value: string) {
+    if (value.trim()) {
+      window.history.replaceState(null, "", `#${value.trim()}`);
+    } else {
+      window.history.replaceState(null, "", window.location.pathname);
+    }
+  }
+
+  // Sync hash → state on mount and hashchange
+  useEffect(() => {
+    let mounted = true;
+    const handleHash = () => {
+      const hash = window.location.hash.replace(/^#/, "").trim();
+      if (hash && mounted) {
+        url.value = hash;
+        // Auto-run test on initial load with hash
+        setTimeout(() => {
+          if (mounted && url.value === hash) runTest();
+        }, 0);
+      }
+    };
+    handleHash();
+    globalThis.addEventListener("hashchange", handleHash);
+    return () => {
+      mounted = false;
+      globalThis.removeEventListener("hashchange", handleHash);
+    };
+  }, []);
+
   async function runTest() {
     const testUrl = url.value.trim();
     if (!testUrl) return;
+
+    // Update hash when running a test
+    updateHash(testUrl);
 
     loading.value = true;
     result.value = null;
